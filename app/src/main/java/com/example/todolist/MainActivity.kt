@@ -1,4 +1,4 @@
-package com.example.todolist // ※ご自身のプロジェクトのパッケージ名に書き換えてください
+package com.example.todolist
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -26,60 +26,81 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.room.*
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.launch
 import java.time.LocalDate
 
-// 1. データモデル
+// 1. データモデル (Roomのテーブル設計図にアップグレード)
+@Entity(tableName = "todo_table")
 data class TodoItem(
-    val id: Int,
+    @PrimaryKey(autoGenerate = true) val id: Int = 0, // 自動で連番を振る
     val title: String,
     var isDone: Boolean = false,
     val isDaily: Boolean = false,
     var lastCompletedDate: Long? = null
 )
 
-// 2. ViewModel
-class TodoViewModel : ViewModel() {
-    private var _todoList = mutableStateListOf<TodoItem>()
-    val todoList: List<TodoItem> get() = _todoList
-    private var nextId = 1
+// 2. DAO (データベースへの命令)
+@Dao
+interface TodoDao {
+    @Query("SELECT * FROM todo_table ORDER BY id ASC")
+    fun getAllTodos(): Flow<List<TodoItem>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertTodo(todo: TodoItem)
+
+    @Update
+    suspend fun updateTodo(todo: TodoItem)
+
+    @Delete
+    suspend fun deleteTodo(todo: TodoItem)
+}
+
+// 3. データベース本体
+@Database(entities = [TodoItem::class], version = 1, exportSchema = false)
+abstract class TodoDatabase : RoomDatabase() {
+    abstract fun todoDao(): TodoDao
+}
+
+// 4. ViewModel (データベースとやり取りするように変更)
+class TodoViewModel(private val dao: TodoDao) : ViewModel() {
+    // データベースから常に最新のリストを受け取る
+    val todoList: Flow<List<TodoItem>> = dao.getAllTodos()
 
     var isDeleteMode by mutableStateOf(false)
     var selectedForDeletion = mutableStateListOf<Int>()
     var showAddDialog by mutableStateOf(false)
 
-    val activeTodos: List<TodoItem> get() = _todoList.filter { !it.isDone }
-    val completedTodos: List<TodoItem> get() = _todoList.filter { it.isDone }
-
-    init {
-        checkAndResetDailyTasks()
-    }
-
-    fun checkAndResetDailyTasks() {
-        val today = LocalDate.now().toEpochDay()
-        for (i in _todoList.indices) {
-            val item = _todoList[i]
-            if (item.isDaily && item.isDone && item.lastCompletedDate != today) {
-                _todoList[i] = item.copy(isDone = false, lastCompletedDate = null)
+    fun checkAndResetDailyTasks(todos: List<TodoItem>) {
+        viewModelScope.launch {
+            val today = LocalDate.now().toEpochDay()
+            todos.forEach { item ->
+                if (item.isDaily && item.isDone && item.lastCompletedDate != today) {
+                    dao.updateTodo(item.copy(isDone = false, lastCompletedDate = null))
+                }
             }
         }
     }
 
     fun addTodo(title: String, isDaily: Boolean) {
         if (title.isNotBlank()) {
-            _todoList.add(TodoItem(id = nextId++, title = title, isDaily = isDaily))
+            viewModelScope.launch {
+                dao.insertTodo(TodoItem(title = title, isDaily = isDaily))
+            }
         }
     }
 
-    fun toggleTodo(id: Int) {
-        val index = _todoList.indexOfFirst { it.id == id }
-        if (index != -1) {
-            val item = _todoList[index]
+    fun toggleTodo(todo: TodoItem) {
+        viewModelScope.launch {
             val today = LocalDate.now().toEpochDay()
-            if (!item.isDone) {
-                _todoList[index] = item.copy(isDone = true, lastCompletedDate = today)
+            if (!todo.isDone) {
+                dao.updateTodo(todo.copy(isDone = true, lastCompletedDate = today))
             } else {
-                _todoList[index] = item.copy(isDone = false, lastCompletedDate = null)
+                dao.updateTodo(todo.copy(isDone = false, lastCompletedDate = null))
             }
         }
     }
@@ -92,33 +113,72 @@ class TodoViewModel : ViewModel() {
         }
     }
 
-    fun deleteSelectedTasks() {
-        _todoList.removeAll { selectedForDeletion.contains(it.id) }
-        selectedForDeletion.clear()
-        isDeleteMode = false
+    fun deleteSelectedTasks(todos: List<TodoItem>) {
+        viewModelScope.launch {
+            val toDelete = todos.filter { selectedForDeletion.contains(it.id) }
+            toDelete.forEach { dao.deleteTodo(it) }
+            selectedForDeletion.clear()
+            isDeleteMode = false
+        }
     }
 }
 
+// ViewModelにDAOを渡すための工場クラス
+class TodoViewModelFactory(private val dao: TodoDao) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass.isAssignableFrom(TodoViewModel::class.java)) {
+            @Suppress("UNCHECKED_CAST")
+            return TodoViewModel(dao) as T
+        }
+        throw IllegalArgumentException("Unknown ViewModel class")
+    }
+}
+
+// 5. Activity
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // データベースの準備
+        val db = Room.databaseBuilder(
+            applicationContext,
+            TodoDatabase::class.java, "todo-database"
+        ).build()
+
         setContent {
             MaterialTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    TodoScreen()
+                    // ViewModelを初期化して画面に渡す
+                    val viewModel: TodoViewModel = viewModel(
+                        factory = TodoViewModelFactory(db.todoDao())
+                    )
+                    TodoScreen(viewModel)
                 }
             }
         }
     }
 }
 
-// 3. UI画面
+// 6. UI画面
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun TodoScreen(viewModel: TodoViewModel = viewModel()) {
+fun TodoScreen(viewModel: TodoViewModel) {
+    // Flowからデータを監視してUIに反映
+    val todoList by viewModel.todoList.collectAsState(initial = emptyList())
+
+    // データが更新されたら日付チェックを走らせる
+    LaunchedEffect(todoList) {
+        if (todoList.isNotEmpty()) {
+            viewModel.checkAndResetDailyTasks(todoList)
+        }
+    }
+
+    val activeTodos = todoList.filter { !it.isDone }
+    val completedTodos = todoList.filter { it.isDone }
+
     var expandedMenu by remember { mutableStateOf(false) }
     var showCompleted by remember { mutableStateOf(false) }
 
@@ -167,7 +227,7 @@ fun TodoScreen(viewModel: TodoViewModel = viewModel()) {
         floatingActionButton = {
             if (viewModel.isDeleteMode) {
                 FloatingActionButton(
-                    onClick = { viewModel.deleteSelectedTasks() },
+                    onClick = { viewModel.deleteSelectedTasks(todoList) },
                     containerColor = MaterialTheme.colorScheme.errorContainer
                 ) {
                     Icon(Icons.Default.Delete, contentDescription = "選択したタスクを削除")
@@ -187,19 +247,17 @@ fun TodoScreen(viewModel: TodoViewModel = viewModel()) {
         ) {
             item { Spacer(modifier = Modifier.height(16.dp)) }
 
-            // ① 未完了のタスクリスト
-            items(viewModel.activeTodos, key = { it.id }) { todo ->
+            items(activeTodos, key = { it.id }) { todo ->
                 TodoRow(
                     todo = todo,
                     isDeleteMode = viewModel.isDeleteMode,
                     isSelectedForDeletion = viewModel.selectedForDeletion.contains(todo.id),
-                    onToggleDone = { viewModel.toggleTodo(todo.id) },
+                    onToggleDone = { viewModel.toggleTodo(todo) },
                     onToggleSelection = { viewModel.toggleSelection(todo.id) }
                 )
             }
 
-            // ② 完了済みタスクの折りたたみタブ
-            if (viewModel.completedTodos.isNotEmpty()) {
+            if (completedTodos.isNotEmpty()) {
                 item {
                     Divider(modifier = Modifier.padding(vertical = 8.dp))
                     Row(
@@ -211,7 +269,7 @@ fun TodoScreen(viewModel: TodoViewModel = viewModel()) {
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = "完了したタスク (${viewModel.completedTodos.size})",
+                            text = "完了したタスク (${completedTodos.size})",
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.secondary
                         )
@@ -224,12 +282,12 @@ fun TodoScreen(viewModel: TodoViewModel = viewModel()) {
                 }
 
                 if (showCompleted) {
-                    items(viewModel.completedTodos, key = { it.id }) { todo ->
+                    items(completedTodos, key = { it.id }) { todo ->
                         TodoRow(
                             todo = todo,
                             isDeleteMode = viewModel.isDeleteMode,
                             isSelectedForDeletion = viewModel.selectedForDeletion.contains(todo.id),
-                            onToggleDone = { viewModel.toggleTodo(todo.id) },
+                            onToggleDone = { viewModel.toggleTodo(todo) },
                             onToggleSelection = { viewModel.toggleSelection(todo.id) }
                         )
                     }
@@ -251,7 +309,6 @@ fun TodoScreen(viewModel: TodoViewModel = viewModel()) {
     }
 }
 
-// 4. 各タスクの行
 @Composable
 fun TodoRow(
     todo: TodoItem,
@@ -290,7 +347,6 @@ fun TodoRow(
                 color = if (todo.isDone && !isDeleteMode) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f) else MaterialTheme.colorScheme.onSurface
             )
 
-            // ▼ ここを変更しました：1回限りの分岐を消し、繰り返しのテキストを変更
             if (todo.isDaily) {
                 Spacer(modifier = Modifier.height(4.dp))
                 Row(
@@ -311,7 +367,6 @@ fun TodoRow(
     }
 }
 
-// 5. タスク追加ダイアログ
 @Composable
 fun AddTodoDialog(onDismiss: () -> Unit, onAdd: (String, Boolean) -> Unit) {
     var inputText by remember { mutableStateOf("") }
